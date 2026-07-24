@@ -25,6 +25,7 @@
 #include <LittleFS.h>
 #include "esp_http_server.h"
 #include <vector>
+#include <map>
 
 // ---- Wi-Fi AP settings: edit these ----
 const char *AP_SSID     = "XIAO-CAM";
@@ -111,6 +112,22 @@ static int countFilesWithPrefix(const String &label) {
     file = root.openNextFile();
   }
   return count;
+}
+
+// Per-label next-index cache so /save doesn't have to rescan the whole
+// filesystem (which gets slower the more files pile up) on every capture.
+static std::map<String, int> labelCounters;
+
+static int nextIndexForLabel(const String &label) {
+  auto it = labelCounters.find(label);
+  int next;
+  if (it == labelCounters.end()) {
+    next = countFilesWithPrefix(label) + 1; // first time seeing this label: scan once
+  } else {
+    next = it->second;
+  }
+  labelCounters[label] = next + 1;
+  return next;
 }
 
 // ---------------- minimal ZIP writer (stored/no compression) ----------------
@@ -230,7 +247,7 @@ static esp_err_t save_handler(httpd_req_t *req) {
     return ESP_FAIL;
   }
 
-  int idx = countFilesWithPrefix(label) + 1;
+  int idx = nextIndexForLabel(label);
   char path[96];
   snprintf(path, sizeof(path), "/%s_%03d.jpg", label.c_str(), idx);
 
