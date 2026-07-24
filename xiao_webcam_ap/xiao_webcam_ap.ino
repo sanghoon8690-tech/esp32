@@ -364,7 +364,7 @@ static esp_err_t download_all_handler(httpd_req_t *req) {
     memset(hdr, 0, sizeof(hdr));
     put_u32(hdr + 0, 0x04034b50);
     put_u16(hdr + 4, 20);
-    put_u16(hdr + 6, 0);
+    put_u16(hdr + 6, 0x0800); // EFS bit: filename is UTF-8 (our labels can be Korean)
     put_u16(hdr + 8, 0);
     put_u16(hdr + 10, 0);
     put_u16(hdr + 12, 0x21);
@@ -397,7 +397,7 @@ static esp_err_t download_all_handler(httpd_req_t *req) {
       put_u32(chdr + 0, 0x02014b50);
       put_u16(chdr + 4, 20);
       put_u16(chdr + 6, 20);
-      put_u16(chdr + 8, 0);
+      put_u16(chdr + 8, 0x0800); // EFS bit: filename is UTF-8, must match local header
       put_u16(chdr + 10, 0);
       put_u16(chdr + 12, 0);
       put_u16(chdr + 14, 0x21);
