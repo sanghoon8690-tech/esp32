@@ -93,6 +93,10 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     if (res != ESP_OK) {
       break;
     }
+    // Cap the stream to ~15fps instead of running flat-out; the camera/WiFi
+    // radio otherwise stay saturated 100% of the time, which is the main
+    // driver of heat during continuous streaming.
+    vTaskDelay(pdMS_TO_TICKS(66));
   }
   return res;
 }
@@ -172,7 +176,7 @@ void setup() {
   WiFi.mode(WIFI_AP);
   WiFi.setSleep(false);               // AP-mode modem sleep causes drops/stutter mid-stream
   WiFi.softAP(AP_SSID, AP_PASSWORD);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm); // max TX power for better range/link margin
+  WiFi.setTxPower(WIFI_POWER_15dBm); // boosted for range, but not flat-out max (runs hot at 19.5dBm)
   IPAddress apIP = WiFi.softAPIP();
 
   Serial.printf("AP started. SSID: %s\n", AP_SSID);
