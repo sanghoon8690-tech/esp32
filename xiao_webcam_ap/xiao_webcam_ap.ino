@@ -48,28 +48,16 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html><head><meta charset="utf-8">
 <title>XIAO ESP32S3 Cam</title>
 <style>
-  body{background:#111;margin:0;display:flex;flex-direction:column;justify-content:center;align-items:center;height:100vh;gap:12px}
+  body{background:#111;margin:0;display:flex;flex-direction:column;justify-content:center;align-items:center;height:100vh;gap:10px}
   img{max-width:100%;height:auto}
   button{font-size:18px;padding:10px 20px;border:none;border-radius:8px;background:#2d7;color:#000}
   button:active{background:#1a5}
+  p{color:#aaa;font-size:13px;margin:0}
 </style></head>
 <body>
 <img id="cam" src="/stream">
-<button onclick="capture()">사진 찍기</button>
-<script>
-function capture() {
-  fetch('/capture').then(r => r.blob()).then(blob => {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'xiao-cam-' + Date.now() + '.jpg';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  });
-}
-</script>
+<button onclick="window.open('/capture', '_blank')">사진 찍기</button>
+<p>새 탭에서 사진을 길게 눌러 "사진에 저장"을 선택하세요</p>
 </body></html>
 )rawliteral";
 
@@ -86,6 +74,7 @@ static esp_err_t capture_handler(httpd_req_t *req) {
   }
   httpd_resp_set_type(req, "image/jpeg");
   httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
   esp_camera_fb_return(fb);
   return res;
