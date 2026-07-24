@@ -43,12 +43,42 @@ VSYNC 38        HREF  47       PCLK  13
 
 `esp32/xiao_webcam_ap/xiao_webcam_ap.ino` in this repo is a working,
 compile-verified sketch: it starts a Wi-Fi AP (`WiFi.softAP`), inits the
-camera, and serves an MJPEG stream via `esp_http_server` at `/` (viewer
-page) and `/stream` (raw multipart JPEG stream), reachable at
+camera, and serves an MJPEG stream via `esp_http_server`, reachable at
 `http://192.168.4.1/` once connected to the AP.
 
 Edit `AP_SSID` / `AP_PASSWORD` at the top of the file for the user's
 desired network name/password.
+
+Routes:
+- `/` — viewer page: live stream, a label input + "캡처" button
+  (Teachable-Machine style dataset capture), links to preview/`/files`.
+- `/stream` — raw MJPEG stream.
+- `/capture` — single full-quality JPEG, opened in a new tab so the user
+  can long-press-save it (reliable cross-browser; a fetch+blob+`<a
+  download>` trick was tried first and is unreliable on mobile Safari).
+- `/save?label=X` — captures a frame and writes it to onboard flash
+  (LittleFS) as `/X_NNN.jpg`, NNN auto-incrementing per label. Returns
+  JSON `{ok, file, count}`.
+- `/list` — JSON `[{name,size},...]` of everything saved.
+- `/files` — HTML page listing saved captures with per-file download
+  (`Content-Disposition: attachment`, one-tap save) and delete links,
+  plus flash usage (used/total KB).
+- `/delete?file=X` — removes a saved capture.
+
+Onboard flash for LittleFS is only ~1.5MB with the default partition
+scheme — roughly 50-90 QVGA JPEGs. Enough for a small Edge Impulse
+dataset burst per class, but download and clear via `/files` regularly.
+
+### Getting captured images into Edge Impulse
+
+The board has no direct path to Edge Impulse's cloud (it's an isolated
+AP with no internet). The flow is: capture on-device via `/save` →
+download via `/files` (lands in the phone's Downloads, since the PC
+usually can't reach the AP directly — see gotcha below) → move files
+phone-to-PC (cable/cloud) → run
+`edge-impulse-uploader --label <label> <files...>` (already installed
+globally via `npm install -g edge-impulse-cli` in this environment) to
+push them into the user's project.
 
 ## Instructions
 
@@ -88,6 +118,17 @@ reliable enough to stop this roam-back on its own.
 If you must use the PC, expect to have to reconnect repeatedly and check
 `netsh wlan show interfaces` / `Get-NetIPConfiguration` right before each
 test to confirm it's actually still on the AP.
+
+On at least one test machine, this went beyond simple roaming: even a
+freshly-connected PC with the correct 192.168.4.x IP got zero response
+(not even ICMP) from the board — a full timeout, no RST. Ruled out
+McAfee's firewall (disabling it made no difference); root cause was never
+conclusively found (Windows Defender Firewall on the "Public" network
+profile is the next suspect, untested). `esp32/xiao_webcam_ap/capture-to-pc.ps1`
+attempts to work around the roaming half of this (suspends other Wi-Fi
+profiles' auto-connect, polls for the right IP before requesting) but
+still isn't reliable on that machine. Don't assume it'll work — verify,
+and fall back to phone-capture + manual transfer if it doesn't.
 
 ## Known gotcha: stuttering / disconnects over the AP link
 
