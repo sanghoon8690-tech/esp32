@@ -24,6 +24,7 @@
 #include <WiFi.h>
 #include <LittleFS.h>
 #include "esp_http_server.h"
+#include <vector>
 
 // ---- Wi-Fi AP settings: edit these ----
 const char *AP_SSID     = "XIAO-CAM";
@@ -110,6 +111,45 @@ static int countFilesWithPrefix(const String &label) {
     file = root.openNextFile();
   }
   return count;
+}
+
+// ---------------- minimal ZIP writer (stored/no compression) ----------------
+
+static uint32_t crc32_table[256];
+static bool crc32_table_ready = false;
+
+static void crc32_init() {
+  for (uint32_t i = 0; i < 256; i++) {
+    uint32_t c = i;
+    for (int k = 0; k < 8; k++) {
+      c = (c & 1) ? (0xEDB88320 ^ (c >> 1)) : (c >> 1);
+    }
+    crc32_table[i] = c;
+  }
+  crc32_table_ready = true;
+}
+
+static uint32_t crc32_update(uint32_t crc, const uint8_t *buf, size_t len) {
+  if (!crc32_table_ready) {
+    crc32_init();
+  }
+  crc ^= 0xFFFFFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc = crc32_table[(crc ^ buf[i]) & 0xFF] ^ (crc >> 8);
+  }
+  return crc ^ 0xFFFFFFFF;
+}
+
+static void put_u16(uint8_t *p, uint16_t v) {
+  p[0] = v & 0xFF;
+  p[1] = (v >> 8) & 0xFF;
+}
+
+static void put_u32(uint8_t *p, uint32_t v) {
+  p[0] = v & 0xFF;
+  p[1] = (v >> 8) & 0xFF;
+  p[2] = (v >> 16) & 0xFF;
+  p[3] = (v >> 24) & 0xFF;
 }
 
 // ---------------- page templates ----------------
@@ -267,6 +307,124 @@ static esp_err_t download_handler(httpd_req_t *req) {
   return res;
 }
 
+static esp_err_t download_all_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "application/zip");
+  httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"dataset.zip\"");
+
+  struct Entry {
+    String name;
+    uint32_t crc;
+    uint32_t size;
+    uint32_t offset;
+  };
+  std::vector<Entry> entries;
+
+  static uint8_t filebuf[40960]; // max single-file size we'll bundle
+  uint8_t hdr[32];
+  esp_err_t res = ESP_OK;
+  uint32_t offset = 0;
+
+  File root = LittleFS.open("/");
+  File file = root.openNextFile();
+  while (file && res == ESP_OK) {
+    String name = String(file.name());
+    if (!name.startsWith("/")) {
+      name = "/" + name;
+    }
+    name = name.substring(1);
+    size_t fsize = file.size();
+
+    if (fsize == 0 || fsize > sizeof(filebuf)) {
+      file.close();
+      file = root.openNextFile();
+      continue; // skip anything that won't fit the buffer (shouldn't happen for our captures)
+    }
+
+    size_t n = file.read(filebuf, fsize);
+    file.close();
+    uint32_t crc = crc32_update(0, filebuf, n);
+
+    memset(hdr, 0, sizeof(hdr));
+    put_u32(hdr + 0, 0x04034b50);
+    put_u16(hdr + 4, 20);
+    put_u16(hdr + 6, 0);
+    put_u16(hdr + 8, 0);
+    put_u16(hdr + 10, 0);
+    put_u16(hdr + 12, 0x21);
+    put_u32(hdr + 14, crc);
+    put_u32(hdr + 18, n);
+    put_u32(hdr + 22, n);
+    put_u16(hdr + 26, name.length());
+    put_u16(hdr + 28, 0);
+
+    res = httpd_resp_send_chunk(req, (const char *)hdr, 30);
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, name.c_str(), name.length());
+    }
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, (const char *)filebuf, n);
+    }
+
+    Entry e{ name, crc, (uint32_t)n, offset };
+    entries.push_back(e);
+    offset += 30 + name.length() + n;
+
+    file = root.openNextFile();
+  }
+
+  if (res == ESP_OK) {
+    uint32_t cd_start = offset;
+    for (auto &e : entries) {
+      uint8_t chdr[48];
+      memset(chdr, 0, sizeof(chdr));
+      put_u32(chdr + 0, 0x02014b50);
+      put_u16(chdr + 4, 20);
+      put_u16(chdr + 6, 20);
+      put_u16(chdr + 8, 0);
+      put_u16(chdr + 10, 0);
+      put_u16(chdr + 12, 0);
+      put_u16(chdr + 14, 0x21);
+      put_u32(chdr + 16, e.crc);
+      put_u32(chdr + 20, e.size);
+      put_u32(chdr + 24, e.size);
+      put_u16(chdr + 28, e.name.length());
+      put_u16(chdr + 30, 0);
+      put_u16(chdr + 32, 0);
+      put_u16(chdr + 34, 0);
+      put_u16(chdr + 36, 0);
+      put_u32(chdr + 38, 0);
+      put_u32(chdr + 42, e.offset);
+
+      res = httpd_resp_send_chunk(req, (const char *)chdr, 46);
+      if (res == ESP_OK) {
+        res = httpd_resp_send_chunk(req, e.name.c_str(), e.name.length());
+      }
+      if (res != ESP_OK) {
+        break;
+      }
+      offset += 46 + e.name.length();
+    }
+
+    if (res == ESP_OK) {
+      uint32_t cd_size = offset - cd_start;
+      uint8_t eocd[22];
+      memset(eocd, 0, sizeof(eocd));
+      put_u32(eocd + 0, 0x06054b50);
+      put_u16(eocd + 4, 0);
+      put_u16(eocd + 6, 0);
+      put_u16(eocd + 8, entries.size());
+      put_u16(eocd + 10, entries.size());
+      put_u32(eocd + 12, cd_size);
+      put_u32(eocd + 16, cd_start);
+      put_u16(eocd + 20, 0);
+      res = httpd_resp_send_chunk(req, (const char *)eocd, 22);
+    }
+  }
+
+  httpd_resp_send_chunk(req, NULL, 0);
+  return res;
+}
+
 static esp_err_t delete_handler(httpd_req_t *req) {
   char query[96], val[64];
   if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
@@ -287,6 +445,7 @@ static esp_err_t files_handler(httpd_req_t *req) {
   html += ".del{color:#f66;margin-left:12px}</style></head><body>";
   html += "<p><a href='/'>&larr; 카메라로 돌아가기</a></p><h2>저장된 사진</h2>";
   html += "<p>" + String(LittleFS.usedBytes() / 1024) + "KB / " + String(LittleFS.totalBytes() / 1024) + "KB 사용 중</p>";
+  html += "<p><a href='/download_all' style='display:inline-block;background:#2d7;color:#000;padding:8px 14px;border-radius:6px;text-decoration:none;font-weight:bold'>전체 다운로드 (ZIP)</a></p>";
 
   File root = LittleFS.open("/");
   File file = root.openNextFile();
@@ -357,17 +516,18 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 static void startCameraServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
-  config.max_uri_handlers = 8;
+  config.max_uri_handlers = 9;
   config.stack_size = 8192; // string-heavy handlers (files/list) need more than the 4K default
 
-  httpd_uri_t index_uri    = { .uri = "/",         .method = HTTP_GET, .handler = index_handler,    .user_ctx = NULL };
-  httpd_uri_t stream_uri   = { .uri = "/stream",   .method = HTTP_GET, .handler = stream_handler,   .user_ctx = NULL };
-  httpd_uri_t capture_uri  = { .uri = "/capture",  .method = HTTP_GET, .handler = capture_handler,  .user_ctx = NULL };
-  httpd_uri_t save_uri     = { .uri = "/save",     .method = HTTP_GET, .handler = save_handler,     .user_ctx = NULL };
-  httpd_uri_t list_uri     = { .uri = "/list",     .method = HTTP_GET, .handler = list_handler,     .user_ctx = NULL };
-  httpd_uri_t files_uri    = { .uri = "/files",    .method = HTTP_GET, .handler = files_handler,    .user_ctx = NULL };
-  httpd_uri_t download_uri = { .uri = "/download", .method = HTTP_GET, .handler = download_handler, .user_ctx = NULL };
-  httpd_uri_t delete_uri   = { .uri = "/delete",   .method = HTTP_GET, .handler = delete_handler,   .user_ctx = NULL };
+  httpd_uri_t index_uri        = { .uri = "/",             .method = HTTP_GET, .handler = index_handler,        .user_ctx = NULL };
+  httpd_uri_t stream_uri       = { .uri = "/stream",       .method = HTTP_GET, .handler = stream_handler,       .user_ctx = NULL };
+  httpd_uri_t capture_uri      = { .uri = "/capture",      .method = HTTP_GET, .handler = capture_handler,      .user_ctx = NULL };
+  httpd_uri_t save_uri         = { .uri = "/save",         .method = HTTP_GET, .handler = save_handler,         .user_ctx = NULL };
+  httpd_uri_t list_uri         = { .uri = "/list",         .method = HTTP_GET, .handler = list_handler,         .user_ctx = NULL };
+  httpd_uri_t files_uri        = { .uri = "/files",        .method = HTTP_GET, .handler = files_handler,        .user_ctx = NULL };
+  httpd_uri_t download_uri     = { .uri = "/download",     .method = HTTP_GET, .handler = download_handler,     .user_ctx = NULL };
+  httpd_uri_t download_all_uri = { .uri = "/download_all", .method = HTTP_GET, .handler = download_all_handler, .user_ctx = NULL };
+  httpd_uri_t delete_uri       = { .uri = "/delete",       .method = HTTP_GET, .handler = delete_handler,       .user_ctx = NULL };
 
   if (httpd_start(&stream_httpd, &config) == ESP_OK) {
     httpd_register_uri_handler(stream_httpd, &index_uri);
@@ -377,6 +537,7 @@ static void startCameraServer() {
     httpd_register_uri_handler(stream_httpd, &list_uri);
     httpd_register_uri_handler(stream_httpd, &files_uri);
     httpd_register_uri_handler(stream_httpd, &download_uri);
+    httpd_register_uri_handler(stream_httpd, &download_all_uri);
     httpd_register_uri_handler(stream_httpd, &delete_uri);
   }
 }
